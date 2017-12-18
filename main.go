@@ -2,10 +2,11 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"gopkg.in/urfave/cli.v1" // imports as package "cli"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -25,7 +26,7 @@ func reboot() {
 	uptime, err := ioutil.ReadFile("/proc/uptime")
 	check(err)
 
-	uptimeSeconds := binary.BigEndian.Uint64(bytes.Split(uptime, []byte(" "))[0])
+	uptimeSeconds, _ := strconv.ParseFloat(string(bytes.Split(uptime, []byte(" "))[0]), 64)
 
 	if uptimeSeconds > 3600 {
 		fmt.Println("Rebooting system...")
@@ -36,26 +37,13 @@ func reboot() {
 
 }
 
-func watch(c *cli.Context) error {
-	logFile := c.String("log")
-
-	for {
-		fileInfo, err := os.Stat(logFile)
-		check(err)
-
-		file, err := os.Open(logFile)
-		check(err)
-		defer file.Close()
-
-		buff := make([]byte, 1024)
-
-		file.ReadAt(buff, fileInfo.Size()-1024)
-
-		r, _ := regexp.Compile("ETH:")
+func hashCheck(logFile string) bool {
+	buff := tail(logFile)
+	if buff != nil {
+		r, _ := regexp.Compile("ETH: G")
 		rHash, _ := regexp.Compile("GPU[0-9]? ([0-9]*)")
 
 		lines := strings.Split(string(buff), "\n")
-		restart := false
 		for i := len(lines) - 1; i > 0; i-- {
 			if r.Match([]byte(lines[i])) {
 				fmt.Println("Line Matched")
@@ -68,18 +56,112 @@ func watch(c *cli.Context) error {
 				fmt.Println(hashes)
 				for _, hash := range hashes {
 					if hash == 0 {
-						restart = true
-						break
+						return true
 					}
 				}
 			}
 		}
-		if restart {
+	}
+	return false
+}
+
+func timeCheck() bool {
+	uptime, err := ioutil.ReadFile("/proc/uptime")
+	check(err)
+
+	uptimeSeconds, _ := strconv.ParseFloat(string(bytes.Split(uptime, []byte(" "))[0]), 64)
+
+	fmt.Println(uptimeSeconds)
+
+	if uptimeSeconds > 86400 {
+		return true
+	}
+	return false
+}
+
+func apiCheck(serverHash string, rigHash string) bool {
+	url := fmt.Sprintf("http://%v.ethosdistro.com/?json=yes", serverHash)
+	resp, err := http.Get(url)
+	defer resp.Body.Close()
+
+	check(err)
+
+	if err != nil {
+		return false
+	}
+
+	fmt.Println("api success")
+
+	body, err := ioutil.ReadAll(resp.Body)
+
+	if err != nil {
+		return false
+	}
+	type RigResponse struct {
+		ServerTime int64 `json:"server_time"`
+	}
+
+	type MinerResponse struct {
+		Rigs map[string]RigResponse
+	}
+
+	res := MinerResponse{}
+	json.Unmarshal(body, &res)
+
+	rig, ok := res.Rigs[rigHash]
+
+	if !ok {
+		return false
+	}
+
+	fmt.Println("Unmarshal success")
+
+	fmt.Println(rig.ServerTime)
+
+	t := time.Now().Unix()
+
+	fmt.Println(t)
+
+	if t-rig.ServerTime > 3600 {
+		fmt.Println("server hasnt reported in an hour fam")
+		return true
+	}
+	fmt.Println("Server has been up fam")
+	return false
+}
+
+func tail(logFile string) []byte {
+
+	file, err := os.Open(logFile)
+	defer file.Close()
+
+	if err != nil {
+		return nil
+	}
+
+	buff := make([]byte, 1024)
+
+	fileInfo, err := os.Stat(logFile)
+	file.ReadAt(buff, fileInfo.Size()-1024)
+
+	return buff
+}
+
+func watch(c *cli.Context) error {
+	logFile := c.String("log")
+	rigHash := c.String("rig")
+	serverHash := c.String("server")
+
+	for {
+		restartTime := timeCheck()
+		restartHash := hashCheck(logFile)
+		restartAPI := apiCheck(serverHash, rigHash)
+
+		if restartHash || restartTime || restartAPI {
 			reboot()
 		}
 		time.Sleep(time.Duration(5) * time.Minute)
 	}
-	return nil
 }
 
 func install(c *cli.Context) error {
@@ -92,7 +174,6 @@ func install(c *cli.Context) error {
 	author      "Sam Bolgert"
 	
 	start on filesystem
-	stop on shutdown
 	
 	script
 		exec /home/ethos/foreman watch
@@ -121,7 +202,7 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "Foreman"
 	app.Usage = "Makes sure miners keep mining"
-	app.Version = "0.0.1a"
+	app.Version = "0.0.2"
 	app.Commands = []cli.Command{
 		{
 			Name:    "watch",
@@ -134,6 +215,16 @@ func main() {
 					Value: "/var/run/miner.output",
 					Usage: "Log file to watch for mining",
 				},
+				cli.StringFlag{
+					Name:  "server",
+					Value: "a63b06",
+					Usage: "Server hash to monitor for external validation",
+				},
+				cli.StringFlag{
+					Name:  "rig",
+					Value: "4d1d7f",
+					Usage: "Rig hash to monitor for external validation",
+				},
 			},
 			//TODO configure reboot threshold
 			//TODO configure coin
@@ -143,7 +234,7 @@ func main() {
 			Name:    "install",
 			Aliases: []string{"i"},
 			Usage:   "Installs a systemd service to automatically run watch command on boot",
-			Action: install,
+			Action:  install,
 		},
 	}
 	app.Run(os.Args)
